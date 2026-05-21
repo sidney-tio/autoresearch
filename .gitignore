@@ -13,5 +13,7 @@ run.log
 last_run.jsonl
 best_run.jsonl
 
-# Experiment log — kept untracked on purpose (see CLAUDE.md)
-results.tsv
+# Experiment record — kept untracked on purpose (see CLAUDE.md)
+results.csv
+rules_history/
+outputs_history/

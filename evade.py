@@ -4,30 +4,27 @@ Reads rules.md, injects it into Gemma's system prompt, generates the 60 varied
 LinkedIn posts from seeds.py, scores each with the RoBERTa AI-text detector, and
 prints the metric block. READ-ONLY harness file — the loop only edits rules.md.
 
-Run:  uv run evade.py > run.log 2>&1
+Normally launched by loop.py; standalone:  python evade.py > run.log 2>&1
 """
 
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-from langdetect import DetectorFactory, LangDetectException
-from langdetect import detect as detect_lang
 from openai import AsyncOpenAI
 from transformers import pipeline
 
 from seeds import SEEDS
 from utils import clean_text
 
-DetectorFactory.seed = 0  # make langdetect deterministic
-
 # --- fixed configuration -----------------------------------------------------
 GENERATOR = "google/gemma-4-31B-it"
 DETECTOR = "fakespot-ai/roberta-base-ai-text-detection-v1"
 DETECTOR_DEVICE = 0  # GPU 0; roberta-base co-exists with the vLLM generator on an H200
-VLLM_BASE_URL = "http://localhost:8000/v1"
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 
 BASE_FRAMING = (
     "You are an experienced professional writing posts for LinkedIn.\n"
@@ -40,11 +37,24 @@ GEN_TOP_P = 0.95
 GEN_MAX_TOKENS = 700
 GEN_BASE_SEED = 7          # fixed -> runs differ only because rules.md differs
 
-# quality-check bounds
+# mechanical quality-check bounds
 MIN_WORDS = 40
 MAX_WORDS = 400
 MIN_ASCII_RATIO = 0.90
 MIN_UNIQUE_RATIO = 0.35
+
+# Gemma judge — English-fluency + coherence gate (replaces langdetect)
+JUDGE_SYSTEM = (
+    "You are a strict quality checker for LinkedIn posts.\n"
+    "You are given the full text of one post. Decide whether it is a coherent, "
+    "well-formed LinkedIn post written in fluent, natural English.\n\n"
+    "Reply with exactly one word:\n"
+    "PASS - fluent English and reads as a coherent, sensible LinkedIn post.\n"
+    "FAIL - not English, or incoherent, garbled, repetitive, or not a real post.\n\n"
+    "Output only the single word PASS or FAIL."
+)
+JUDGE_TEMPERATURE = 0.0
+JUDGE_MAX_TOKENS = 4
 
 # label-name heuristics for mapping detector output to P(AI)
 AI_HINTS = ("ai", "machine", "generated", "fake", "gpt", "llm", "synthetic", "bot")
@@ -89,7 +99,7 @@ def generate_all(system_prompt: str) -> list[str]:
 
 
 def quality_check(text: str) -> tuple[bool, str]:
-    """Lightweight gate so the optimizer cannot win by producing junk."""
+    """Mechanical gate: cheap, deterministic checks run before the Gemma judge."""
     if not text:
         return False, "empty"
     words = text.split()
@@ -107,12 +117,38 @@ def quality_check(text: str) -> tuple[bool, str]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) > 2 and len(set(lines)) < len(lines):
         return False, "duplicate_lines"
-    try:
-        if detect_lang(text) != "en":
-            return False, "not_english"
-    except LangDetectException:
-        return False, "langdetect_failed"
     return True, "ok"
+
+
+async def _judge_all(texts: list[str]) -> list[tuple[bool, str]]:
+    client = AsyncOpenAI(base_url=VLLM_BASE_URL, api_key="EMPTY")
+
+    async def judge_one(text: str) -> tuple[bool, str]:
+        resp = await client.chat.completions.create(
+            model=GENERATOR,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            temperature=JUDGE_TEMPERATURE,
+            max_tokens=JUDGE_MAX_TOKENS,
+        )
+        verdict = (resp.choices[0].message.content or "").strip().upper()
+        if "FAIL" in verdict:
+            return False, "judge_fail"
+        return True, "ok"
+
+    try:
+        return list(await asyncio.gather(*(judge_one(t) for t in texts)))
+    finally:
+        await client.close()
+
+
+def judge_all(texts: list[str]) -> list[tuple[bool, str]]:
+    """Ask Gemma to PASS/FAIL each post for English fluency and coherence."""
+    if not texts:
+        return []
+    return asyncio.run(_judge_all(texts))
 
 
 def p_ai_from_scores(scores: list[dict]) -> float:
@@ -138,6 +174,13 @@ def main() -> None:
 
     cleaned = [clean_text(p) for p in posts]
     checks = [quality_check(c) for c in cleaned]
+
+    # Posts that clear the mechanical gate go to the Gemma English/coherence judge.
+    judge_idx = [i for i, (ok, _) in enumerate(checks) if ok]
+    print(f"judging {len(judge_idx)} posts for English + coherence via "
+          f"{GENERATOR}...", file=sys.stderr)
+    for i, verdict in zip(judge_idx, judge_all([cleaned[i] for i in judge_idx])):
+        checks[i] = verdict
     valid_idx = [i for i, (ok, _) in enumerate(checks) if ok]
 
     print(f"scoring with {DETECTOR}...", file=sys.stderr)

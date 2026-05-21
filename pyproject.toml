@@ -7,5 +7,4 @@ dependencies = [
     "vllm>=0.6.0",
     "transformers>=4.44.0",
     "openai>=1.40.0",
-    "langdetect>=1.0.9",
 ]
